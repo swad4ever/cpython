@@ -45,10 +45,10 @@
  * one-level-higher pyvenv.cfg, and uses its "home" property to locate and
  * launch the original python.exe.
  */
-#if defined(VENV_REDIRECT)
+//#if defined(VENV_REDIRECT)
 #define RC_NO_VENV_CFG      106
 #define RC_BAD_VENV_CFG     107
-#endif
+//#endif
 
 /* Just for now - static definition */
 
@@ -493,6 +493,106 @@ get_configured_value(wchar_t * key)
     return result;
 }
 
+static int
+find_key_value(const char* buffer, const char* key, const char** start, DWORD* length)
+{
+	char tmp[256] = { 0 };
+	tmp[0] = '\n';
+	strcat(tmp, key);
+
+	for (const char* s = strstr(buffer, key); s; s = strstr(s + 1, tmp)) {
+		if (*s == '\n') {
+			++s;
+		}
+		for (int i = strlen(key); i > 0 && *s; --i, ++s);
+
+		while (*s && iswspace(*s)) {
+			++s;
+		}
+		if (*s != L'=') {
+			continue;
+		}
+
+		do {
+			++s;
+		} while (*s && iswspace(*s));
+
+		*start = s;
+		char* nl = strchr(s, '\n');
+		if (nl) {
+			*length = (DWORD)((ptrdiff_t)nl - (ptrdiff_t)s);
+		}
+		else {
+			*length = (DWORD)strlen(s);
+		}
+		return 1;
+	}
+	return 0;
+}
+
+static wchar_t* get_value_from_pyvenv_cfg(const wchar_t* cfgpath, const wchar_t* key)
+{
+	FILE* f;
+	char buffer[4096]; /* 4KB should be enough for anybody */
+	char* start;
+	DWORD len, cch, cch_actual;
+	size_t cb;
+	wchar_t* value = NULL;
+
+	if (_wfopen_s(&f, cfgpath, L"r")) {
+		error(RC_BAD_VENV_CFG, L"Cannot read '%ls'", cfgpath);
+	}
+	cb = fread_s(buffer, sizeof(buffer), sizeof(buffer[0]),
+		sizeof(buffer) / sizeof(buffer[0]), f);
+	fclose(f);
+
+	if (!find_key_value(buffer, key, &start, &len)) {
+		error(RC_BAD_VENV_CFG, L"Cannot find %ls in '%ls'", key,
+			cfgpath);
+	}
+
+	cch = MultiByteToWideChar(CP_UTF8, 0, start, len, NULL, 0);
+	if (!cch) {
+		error(0, L"Cannot determine memory for venv cfg value");
+	}
+	cch += 2; /* include sep and null */
+	value = (wchar_t*)malloc(cch * sizeof(wchar_t));
+	if (value == NULL) {
+		error(RC_NO_MEMORY, L"A memory allocation failed");
+	}
+	cch_actual = MultiByteToWideChar(CP_UTF8, 0, start, len, value, cch);
+	if (!cch_actual) {
+		error(RC_BAD_VENV_CFG, L"Cannot decode venv cfg value in '%ls'",
+			cfgpath);
+	}
+
+	return value;
+}
+
+static wchar_t* get_venv_cfg_path()
+{
+	wchar_t* p = NULL;
+	DWORD attrs = 0;
+	wchar_t path[MAX_PATH] = { 0 };
+	wchar_t* tmp_path = NULL;
+
+	tmp_path = get_env(L"VIRTUAL_ENV");
+	p = wcsrchr(tmp_path, L'\\');
+	if (p == NULL) {
+		error(RC_NO_VENV_CFG, L"No pyvenv.cfg file");
+	}
+
+	wcsncpy(path, tmp_path, MAX_PATH - 1);
+	wcscat_s(path, MAX_PATH - 1, L"\\pyvenv.cfg");
+
+	attrs = GetFileAttributesW(path);
+	if (attrs == INVALID_FILE_ATTRIBUTES) {
+		debug(L"File '%ls' non-existent\n", path);
+		return NULL;
+	}
+
+	return path;
+}
 static INSTALLED_PYTHON *
 locate_python(wchar_t * wanted_ver, BOOL from_shebang)
 {
@@ -519,6 +619,26 @@ locate_python(wchar_t * wanted_ver, BOOL from_shebang)
             debug(L"'%ls'\n", result->executable);
         } else {
             debug(L"no interpreter\n");
+		}
+
+		wchar_t* exepath = NULL;
+		wchar_t* version = NULL;
+		exepath = find_python_by_venv();
+		debug(exepath);
+		if (exepath != NULL)
+		{
+			wchar_t* pyvenv_cfg_path = get_venv_cfg_path();
+			if (pyvenv_cfg_path != NULL)
+			{
+				version = get_value_from_pyvenv_cfg(pyvenv_cfg_path, "version");
+				int i = wcsncmp(wanted_ver, version, min(wcslen(version), wcslen(wanted_ver)));
+				if (i==0)
+				{
+					result = &installed_pythons[MAX_INSTALLED_PYTHONS-1]; //reuse static memory for the return
+					wcscpy(result->executable, exepath);
+					wcsncpy(result->version, version, 3);
+				}
+			}
         }
     }
     else {
